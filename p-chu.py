@@ -6,12 +6,68 @@ import ssl
 import threading
 import argparse
 import subprocess
-from typing import Tuple, Optional
 import select
+from typing import Tuple, Optional, List
+
+class VPNNetworkConfig:
+    def __init__(self, tun_interface: str, vpn_network: str):
+        self.tun_interface = tun_interface
+        self.vpn_network = vpn_network
+        self.original_forwarding = self._read_forwarding()
+
+    def _read_forwarding(self) -> str:
+        """Read current IPv4 forwarding setting"""
+        with open('/proc/sys/net/ipv4/ip_forward', 'r') as f:
+            return f.read().strip()
+
+    def _run_commands(self, commands: List[str]):
+        """Run a list of shell commands"""
+        for cmd in commands:
+            try:
+                subprocess.run(cmd.split(), check=True)
+                print(f"Successfully executed: {cmd}")
+            except subprocess.CalledProcessError as e:
+                print(f"Error executing {cmd}: {e}")
+                raise
+
+    def setup_server_nat(self):
+        """Configure NAT on the server"""
+        commands = [
+            "echo 1 > /proc/sys/net/ipv4/ip_forward",
+            "iptables -F",
+            "iptables -t nat -F",
+            f"iptables -A FORWARD -i {self.tun_interface} -j ACCEPT",
+            f"iptables -A FORWARD -o {self.tun_interface} -j ACCEPT",
+            f"iptables -t nat -A POSTROUTING -s {self.vpn_network} -o eth0 -j MASQUERADE"
+        ]
+        
+        self._run_commands(commands)
+        print("Server NAT configuration completed")
+
+    def setup_client_routing(self, server_ip: str):
+        """Configure routing on the client"""
+        commands = [
+            f"ip route add {self.vpn_network} via 10.0.0.1 dev {self.tun_interface}",
+            f"ip route add default via 10.0.0.1 dev {self.tun_interface}"
+        ]
+        
+        self._run_commands(commands)
+        print("Client routing configuration completed")
+
+    def cleanup(self):
+        """Cleanup NAT and routing configuration"""
+        commands = [
+            f"echo {self.original_forwarding} > /proc/sys/net/ipv4/ip_forward",
+            "iptables -F",
+            "iptables -t nat -F"
+        ]
+        
+        self._run_commands(commands)
+        print("Network configuration cleaned up")
 
 class TunInterface:
     """Handles the creation and management of a TUN network interface"""
-    TUNSETIFF = 0x400454ca  # ioctl command for TUN interface
+    TUNSETIFF = 0x400454ca
     IFF_TUN = 0x0001
     IFF_NO_PI = 0x1000
 
@@ -22,19 +78,11 @@ class TunInterface:
 
     def create(self) -> int:
         """Create and configure a TUN interface"""
-        # Open TUN device file
         tun = open('/dev/net/tun', 'rb+')
-        
-        # Create struct for ioctl call
         ifr = struct.pack('16sH', self.name.encode(), self.IFF_TUN | self.IFF_NO_PI)
-        
-        # Create TUN interface
         fcntl.ioctl(tun, self.TUNSETIFF, ifr)
         self.tun_fd = tun.fileno()
-        
-        # Configure interface
         self._configure_interface()
-        
         return self.tun_fd
 
     def _configure_interface(self):
@@ -60,6 +108,7 @@ class EnhancedVPN:
         self.buffer_size = 2048
         self.tun = TunInterface()
         self.running = False
+        self.network_config = VPNNetworkConfig("tun0", "10.0.0.0/24")
 
     def create_ssl_context(self, is_server: bool) -> ssl.SSLContext:
         """Create SSL context for secure communication"""
@@ -79,21 +128,17 @@ class EnhancedVPN:
 
         try:
             while self.running:
-                # Use select to monitor both TUN and socket
                 readable, _, _ = select.select([tun_fd, ssl_socket], [], [], 1)
 
                 for fd in readable:
                     if fd == tun_fd:
-                        # Read from TUN and send to client
                         packet = os.read(tun_fd, self.buffer_size)
                         if packet:
-                            # Add simple packet header (length)
                             length = len(packet)
                             header = struct.pack('!H', length)
                             ssl_socket.send(header + packet)
 
                     elif fd == ssl_socket:
-                        # Read from client and write to TUN
                         header = ssl_socket.recv(2)
                         if not header:
                             break
@@ -110,12 +155,13 @@ class EnhancedVPN:
 
     def run_server(self):
         """Run VPN server"""
-        context = self.create_ssl_context(True)
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        ssl_server = context.wrap_socket(server_socket, server_side=True)
-        
         try:
+            self.network_config.setup_server_nat()
+            context = self.create_ssl_context(True)
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ssl_server = context.wrap_socket(server_socket, server_side=True)
+            
             ssl_server.bind((self.host, self.port))
             ssl_server.listen(5)
             print(f"VPN Server listening on {self.host}:{self.port}")
@@ -134,15 +180,17 @@ class EnhancedVPN:
             self.running = False
         finally:
             ssl_server.close()
+            self.network_config.cleanup()
 
     def run_client(self):
         """Run VPN client"""
-        context = self.create_ssl_context(False)
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ssl_client = context.wrap_socket(client_socket)
-        tun_fd = self.tun.create()
-
         try:
+            context = self.create_ssl_context(False)
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ssl_client = context.wrap_socket(client_socket)
+            tun_fd = self.tun.create()
+            
+            self.network_config.setup_client_routing(self.host)
             ssl_client.connect((self.host, self.port))
             print(f"Connected to VPN server at {self.host}:{self.port}")
             
@@ -152,7 +200,6 @@ class EnhancedVPN:
 
                 for fd in readable:
                     if fd == tun_fd:
-                        # Read from TUN and send to server
                         packet = os.read(tun_fd, self.buffer_size)
                         if packet:
                             length = len(packet)
@@ -160,7 +207,6 @@ class EnhancedVPN:
                             ssl_client.send(header + packet)
 
                     elif fd == ssl_client:
-                        # Read from server and write to TUN
                         header = ssl_client.recv(2)
                         if not header:
                             break
@@ -177,6 +223,7 @@ class EnhancedVPN:
             print(f"Error in client: {e}")
         finally:
             ssl_client.close()
+            self.network_config.cleanup()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Enhanced VPN Implementation")
