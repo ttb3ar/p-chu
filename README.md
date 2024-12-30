@@ -1,19 +1,19 @@
 This is my attempt at making a vpn from scratch
 It will definetly not be perfect but basic functionality should include:
 
--Secure Tunneling
+-Secure Tunneling:
 Creates encrypted tunnel between client and server using SSL/TLS
 Uses TUN interface to capture and route network traffic
 Supports multiple simultaneous client connections
 
 
--Network Configuration
+-Network Configuration:
 Automatically sets up IP addressing (10.0.0.0/24 network)
 Configures routing tables on both client and server
 Implements NAT for internet access through the VPN
 
 
--Production Features
+-Production Features:
 Proper cleanup of network configurations on shutdown
 Error handling and graceful connection termination
 Command-line interface for easy deployment
