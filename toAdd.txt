@@ -1,0 +1,6 @@
+Input validation (prevents crashes)
+Separation of concerns (enables testing)
+Configuration file (makes deployment easier)
+Credentials in memory (security)
+Add basic logging (troubleshooting)
+Basic unit tests (confidence)
